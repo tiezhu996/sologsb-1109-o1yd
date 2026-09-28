@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { db } from '../utils/db';
 import { uid } from '../utils/id';
+import { buildStockMap } from '../utils/stock';
+import { useBatchStore } from './batchStore';
 import type { HerbGroupSummary, HerbMaterial, HerbOrigin, HerbPart } from '../types/herb-material';
 
 export interface HerbInput {
@@ -19,8 +21,9 @@ interface HerbState {
   hydrate: () => Promise<void>;
   addHerb: (input: HerbInput) => Promise<HerbMaterial>;
   updateHerb: (id: string, patch: Partial<HerbInput>) => Promise<void>;
-  removeHerb: (id: string) => Promise<void>;
-  /** 按药材分组回显批次与待炮制量 */
+  /** 删除药材批次；已被工序记录核销（含未锁定）时返回 false，避免占用量悬空 */
+  removeHerb: (id: string) => Promise<boolean>;
+  /** 按药材分组回显批次与待炮制量（按余量合计） */
   groupSummary: () => HerbGroupSummary[];
 }
 
@@ -60,20 +63,33 @@ export const useHerbStore = create<HerbState>()((set, get) => ({
   },
 
   removeHerb: async (id) => {
+    // 已有工序核销记录的批次不能直接删除（锁定记录会一直占用），需先撤销相关工序
+    const referenced = useBatchStore.getState().batches.some((b) => b.herbId === id);
+    if (referenced) {
+      return false;
+    }
     await db.herbs.delete(id);
     set({ herbs: get().herbs.filter((h) => h.id !== id) });
+    return true;
   },
 
   groupSummary: () => {
+    // 待炮制量取各批次余量（入库量 − 工序核销，锁定记录也占用）
+    const stockMap = buildStockMap(get().herbs, useBatchStore.getState().batches);
     const map = new Map<string, HerbGroupSummary>();
     get().herbs.forEach((herb) => {
-      const key = herb.name;
-      const existed = map.get(key);
+      const stock = stockMap.get(herb.id);
+      const feedKg = stock?.feedKg ?? herb.feedKg;
+      const usedKg = stock?.usedKg ?? 0;
+      const remainingKg = Math.max(0, stock?.remainingKg ?? herb.feedKg);
+      const existed = map.get(herb.name);
       if (existed) {
         existed.batches += 1;
-        existed.pendingKg += herb.feedKg;
+        existed.feedKg += feedKg;
+        existed.usedKg += usedKg;
+        existed.pendingKg += remainingKg;
       } else {
-        map.set(key, { name: herb.name, origin: herb.origin, part: herb.part, batches: 1, pendingKg: herb.feedKg });
+        map.set(herb.name, { name: herb.name, origin: herb.origin, part: herb.part, batches: 1, feedKg, usedKg, pendingKg: remainingKg });
       }
     });
     return Array.from(map.values()).sort((a, b) => b.pendingKg - a.pendingKg);

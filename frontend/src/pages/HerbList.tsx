@@ -1,13 +1,15 @@
 import { useMemo, useState } from 'react';
-import { App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
+import { App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Progress, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import dayjs, { type Dayjs } from 'dayjs';
 import FilterBar from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
 import { useHerbFilter } from '../hooks/useHerbFilter';
 import { useHerbStore } from '../stores/herbStore';
+import { useBatchStore } from '../stores/batchStore';
 import { HERB_ORIGINS, HERB_PARTS, type HerbMaterial } from '../types/herb-material';
 import { formatDate } from '../utils/degree';
+import { buildStockMap, formatKg, roundKg, STOCK_EPS } from '../utils/stock';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -25,6 +27,7 @@ interface HerbFormValues {
 export default function HerbList() {
   const { message } = AntApp.useApp();
   const herbs = useHerbStore((s) => s.herbs);
+  const batches = useBatchStore((s) => s.batches);
   const addHerb = useHerbStore((s) => s.addHerb);
   const updateHerb = useHerbStore((s) => s.updateHerb);
   const removeHerb = useHerbStore((s) => s.removeHerb);
@@ -35,16 +38,24 @@ export default function HerbList() {
 
   const visible = useMemo(() => filter.apply(herbs), [herbs, filter]);
 
+  /** 药材批次核销情况：入库量 − 全部工序记录投料（锁定记录继续占用） */
+  const stockMap = useMemo(() => buildStockMap(herbs, batches), [herbs, batches]);
+
   const summary = useMemo(() => {
-    const map = new Map<string, { name: string; origin: string; part: string; batches: number; kg: number }>();
+    const map = new Map<string, { name: string; origin: string; part: string; batches: number; feed: number; used: number; remaining: number }>();
     visible.forEach((herb) => {
-      const row = map.get(herb.name) ?? { name: herb.name, origin: herb.origin, part: herb.part, batches: 0, kg: 0 };
+      const stock = stockMap.get(herb.id);
+      const row = map.get(herb.name) ?? { name: herb.name, origin: herb.origin, part: herb.part, batches: 0, feed: 0, used: 0, remaining: 0 };
       row.batches += 1;
-      row.kg += herb.feedKg;
+      row.feed += stock?.feedKg ?? herb.feedKg;
+      row.used += stock?.usedKg ?? 0;
+      row.remaining += Math.max(0, stock?.remainingKg ?? herb.feedKg);
       map.set(herb.name, row);
     });
-    return Array.from(map.values()).sort((a, b) => b.kg - a.kg);
-  }, [visible]);
+    return Array.from(map.values())
+      .map((row) => ({ ...row, feed: roundKg(row.feed), used: roundKg(row.used), remaining: roundKg(row.remaining) }))
+      .sort((a, b) => b.remaining - a.remaining);
+  }, [visible, stockMap]);
 
   const openCreate = () => {
     setEditing(null);
@@ -71,6 +82,12 @@ export default function HerbList() {
       remark: values.remark,
     };
     if (editing) {
+      // 入库量改小也不能小于已被工序核销的量，否则余量为负
+      const used = stockMap.get(editing.id)?.usedKg ?? 0;
+      if (payload.feedKg + STOCK_EPS < used) {
+        message.error(`入库量不能小于已用量 ${formatKg(used)}kg（锁定工序仍占用）`);
+        return;
+      }
       await updateHerb(editing.id, payload);
       message.success(`已更新药材 ${payload.name}`);
     } else {
@@ -85,7 +102,56 @@ export default function HerbList() {
     { title: '基原', dataIndex: 'origin', width: 80, render: (v: string) => <Tag color="green">{v}</Tag> },
     { title: '药用部位', dataIndex: 'part', width: 90 },
     { title: '批次号', dataIndex: 'batchNo', width: 120 },
-    { title: '投料量(kg)', dataIndex: 'feedKg', width: 110, align: 'right' },
+    {
+      title: '入库量(kg)',
+      dataIndex: 'feedKg',
+      width: 100,
+      align: 'right',
+      render: (v: number) => formatKg(v),
+    },
+    {
+      title: '已用(kg)',
+      width: 100,
+      align: 'right',
+      render: (_, record) => {
+        const used = stockMap.get(record.id)?.usedKg ?? 0;
+        return <Text type={used > 0 ? 'warning' : undefined}>{formatKg(used)}</Text>;
+      },
+    },
+    {
+      title: '余量(kg)',
+      width: 170,
+      render: (_, record) => {
+        const stock = stockMap.get(record.id);
+        const remaining = Math.max(0, stock?.remainingKg ?? record.feedKg);
+        const percent = record.feedKg > 0 ? Math.min(100, Math.round(((stock?.usedKg ?? 0) / record.feedKg) * 100)) : 100;
+        return (
+          <Tooltip title={`已核销 ${formatKg(stock?.usedKg ?? 0)} / 入库 ${formatKg(record.feedKg)} kg`}>
+            <div>
+              <Text type={remaining <= STOCK_EPS ? 'danger' : undefined} strong>
+                {formatKg(remaining)}
+              </Text>
+              <Progress percent={percent} size="small" showInfo={false} status={remaining <= STOCK_EPS ? 'exception' : 'active'} />
+            </div>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: '状态',
+      width: 90,
+      render: (_, record) => {
+        const stock = stockMap.get(record.id);
+        const used = stock?.usedKg ?? 0;
+        if ((stock?.remainingKg ?? record.feedKg) <= STOCK_EPS) {
+          return <Tag color="red">已用完</Tag>;
+        }
+        if (used > 0) {
+          return <Tag color="blue">使用中</Tag>;
+        }
+        return <Tag>待投料</Tag>;
+      },
+    },
     { title: '入库时间', dataIndex: 'receivedAt', width: 120, render: (v: string) => formatDate(v) },
     { title: '备注', dataIndex: 'remark', ellipsis: true, render: (v?: string) => v ?? '-' },
     {
@@ -97,7 +163,17 @@ export default function HerbList() {
           <Button size="small" type="link" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title={`确认删除 ${record.name}（${record.batchNo}）？`} onConfirm={() => removeHerb(record.id).then(() => message.success('已删除'))}>
+          <Popconfirm
+            title={`确认删除 ${record.name}（${record.batchNo}）？`}
+            onConfirm={async () => {
+              const ok = await removeHerb(record.id);
+              if (ok) {
+                message.success('已删除');
+              } else {
+                message.error('该批次已有工序核销记录（含锁定记录），请先在工序记录台撤销相关工序');
+              }
+            }}
+          >
             <Button size="small" type="link" danger>
               删除
             </Button>
@@ -112,7 +188,9 @@ export default function HerbList() {
       <Title level={3} style={{ marginBottom: 4 }}>
         药材与批次台账
       </Title>
-      <Paragraph type="secondary">按基原与药用部位筛选，按药材名分组回显批次数与待炮制投料量。</Paragraph>
+      <Paragraph type="secondary">
+        按基原与药用部位筛选；每次炮制工序按投料量核销对应批次，列表同步显示入库量、已用量与余量，余量清零的批次标记为「已用完」。
+      </Paragraph>
 
       <Space style={{ marginBottom: 12 }}>
         <Button type="primary" onClick={openCreate}>
@@ -144,7 +222,7 @@ export default function HerbList() {
         </EmptyPanel>
       ) : (
         <>
-          <Card size="small" title="按药材分组汇总" style={{ marginBottom: 16 }}>
+          <Card size="small" title="按药材分组汇总（待炮制量按余量合计）" style={{ marginBottom: 16 }}>
             <Table
               rowKey="name"
               size="small"
@@ -154,12 +232,14 @@ export default function HerbList() {
                 { title: '药材名', dataIndex: 'name', width: 120 },
                 { title: '基原', dataIndex: 'origin', width: 80 },
                 { title: '药用部位', dataIndex: 'part', width: 90 },
-                { title: '批次数', dataIndex: 'batches', width: 90, align: 'right' },
-                { title: '待炮制量(kg)', dataIndex: 'kg', width: 130, align: 'right', render: (v: number) => v.toFixed(1) },
+                { title: '批次数', dataIndex: 'batches', width: 80, align: 'right' },
+                { title: '入库量(kg)', dataIndex: 'feed', width: 110, align: 'right', render: (v: number) => formatKg(v) },
+                { title: '已用(kg)', dataIndex: 'used', width: 100, align: 'right', render: (v: number) => formatKg(v) },
+                { title: '待炮制量/余量(kg)', dataIndex: 'remaining', width: 150, align: 'right', render: (v: number) => <Text strong>{formatKg(v)}</Text> },
               ]}
             />
           </Card>
-          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1000 }} />
+          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1450 }} />
         </>
       )}
 

@@ -15,6 +15,7 @@ import { HERB_ORIGINS, HERB_PARTS } from '../types/herb-material';
 import { FIRE_LEVELS, type FireLevel } from '../types/processing-method';
 import { PROCESS_DEGREES, type ProcessBatch, type ProcessDegree } from '../types/process-batch';
 import { DEGREE_RULES, judgeDegree, suggestedValues } from '../utils/degree';
+import { buildStockMap, formatKg, STOCK_EPS, StockOverflowError } from '../utils/stock';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -61,6 +62,7 @@ export default function BatchBoard() {
 
   const watched = Form.useWatch([], form) as Partial<BatchFormValues> | undefined;
   const watchedMethod = methods.find((m) => m.id === (watched?.methodId ?? ''));
+  const watchedHerb = herbs.find((h) => h.id === (watched?.herbId ?? ''));
   const watchedYieldRate = useMemo(() => {
     const feed = Number(watched?.feedKg) || 0;
     const out = Number(watched?.outputKg) || 0;
@@ -80,6 +82,33 @@ export default function BatchBoard() {
   }, [watchedMethod, watched?.fireLevel, watched?.duration, watched?.temp, watchedYieldRate]);
 
   const visibleHerbs = useMemo(() => herbFilter.apply(herbs), [herbs, herbFilter]);
+
+  /** 药材批次余量（锁定与未锁定工序都占用，未锁定记录改动/撤销后自动重算） */
+  const stockMap = useMemo(() => buildStockMap(herbs, batches), [herbs, batches]);
+  /** 新增工序只列还有余量的批次；编辑时保留当前批次本身 */
+  const herbOptions = useMemo(
+    () =>
+      herbs.filter((h) => {
+        if (editing && h.id === editing.herbId) return true;
+        return (stockMap.get(h.id)?.remainingKg ?? 0) > STOCK_EPS;
+      }),
+    [herbs, stockMap, editing],
+  );
+  const availableHerbs = useMemo(() => herbs.filter((h) => (stockMap.get(h.id)?.remainingKg ?? 0) > STOCK_EPS), [herbs, stockMap]);
+
+  /** 当前表单所选批次本次还能投多少（编辑时加回自身投料） */
+  const availableFor = (herbId: string | undefined): number => {
+    if (!herbId) return 0;
+    const stock = stockMap.get(herbId);
+    if (!stock) return 0;
+    if (editing && herbId === editing.herbId) {
+      return Math.max(0, stock.remainingKg + editing.feedKg);
+    }
+    return Math.max(0, stock.remainingKg);
+  };
+
+  const watchedAvailable = availableFor(watched?.herbId);
+
   const visibleBatches = useMemo(() => {
     const ids = new Set(visibleHerbs.map((h) => h.id));
     return batches.filter((b) => {
@@ -89,23 +118,23 @@ export default function BatchBoard() {
     });
   }, [batches, visibleHerbs, degreeParam]);
 
-  const herbName = (id: string) => herbs.find((h) => h.id === id)?.name ?? '未知药材';
   const methodOf = (id: string) => methods.find((m) => m.id === id);
 
   const openCreate = () => {
     setEditing(null);
     setQcMode(false);
     form.resetFields();
-    const firstHerb = herbs[0];
+    const firstHerb = availableHerbs[0];
     const firstMethod = methods[0];
     const now = dayjs();
+    const defaultFeed = firstHerb ? Math.max(0, stockMap.get(firstHerb.id)?.remainingKg ?? firstHerb.feedKg) : 100;
     const base: Partial<BatchFormValues> = {
       batchNo: `PZ-${dayjs().format('YYMMDD')}-${String(batches.length + 1).padStart(2, '0')}`,
       herbId: firstHerb?.id,
       methodId: firstMethod?.id,
-      feedKg: firstHerb?.feedKg ?? 100,
-      outputKg: Number((((firstHerb?.feedKg ?? 100) * 0.94)).toFixed(1)),
-      auxUsedKg: Number((((firstHerb?.feedKg ?? 100) * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
+      feedKg: Number(defaultFeed.toFixed(3)),
+      outputKg: Number((defaultFeed * 0.94).toFixed(1)),
+      auxUsedKg: Number(((defaultFeed * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
       fireLevel: firstMethod?.fireLevel ?? '文火',
       temp: firstMethod ? Math.round((firstMethod.tempRange[0] + firstMethod.tempRange[1]) / 2) : 100,
       duration: firstMethod?.duration ?? 12,
@@ -150,6 +179,12 @@ export default function BatchBoard() {
       message.error('投料量必须大于 0');
       return;
     }
+    // 超出余量直接拦住保存，并提示该批次本次可投数量
+    const available = availableFor(values.herbId);
+    if (feedKg > available + STOCK_EPS) {
+      message.error(`投料量超出余量：该批次本次最多可投 ${formatKg(available)}kg，请调整投料量或改用其他批次`);
+      return;
+    }
     const yieldRate = Number(((outputKg / feedKg) * 100).toFixed(1));
     const payload = {
       batchNo: values.batchNo,
@@ -165,26 +200,51 @@ export default function BatchBoard() {
       operator: values.operator,
       remark: values.remark,
     };
-    if (editing) {
-      const ok = await updateBatch(editing.id, payload, qcMode);
-      if (!ok) {
-        message.error('该批已锁定，请打开「质检员改判」后再提交');
+    try {
+      if (editing) {
+        const ok = await updateBatch(editing.id, payload, qcMode);
+        if (!ok) {
+          message.error('该批已锁定，请打开「质检员改判」后再提交');
+          return;
+        }
+        if (qcMode && editing.locked) {
+          await unlockAsQc(editing.id, '质检员 · 赵敏');
+        }
+        message.success(`已更新 ${payload.batchNo}，得率 ${yieldRate}%，余量已重算`);
+      } else {
+        await createBatch(payload, true);
+        message.success(`已提交 ${payload.batchNo}，得率 ${yieldRate}%，该批已锁定并核销药材余量`);
+      }
+    } catch (error) {
+      if (error instanceof StockOverflowError) {
+        message.error(`投料量超出余量：${error.message}`);
         return;
       }
-      if (qcMode && editing.locked) {
-        await unlockAsQc(editing.id, '质检员 · 赵敏');
-      }
-      message.success(`已更新 ${payload.batchNo}，得率 ${yieldRate}%`);
-    } else {
-      await createBatch(payload, true);
-      message.success(`已提交 ${payload.batchNo}，得率 ${yieldRate}%，该批已锁定`);
+      throw error;
     }
     setOpen(false);
   };
 
   const columns: TableColumnsType<ProcessBatch> = [
     { title: '生产批号', dataIndex: 'batchNo', width: 130, render: (v: string) => <Text strong>{v}</Text> },
-    { title: '药材', dataIndex: 'herbId', width: 90, render: (id: string) => herbName(id) },
+    {
+      title: '药材',
+      dataIndex: 'herbId',
+      width: 130,
+      render: (id: string) => {
+        const herb = herbs.find((h) => h.id === id);
+        if (!herb) return '未知药材';
+        const remaining = Math.max(0, stockMap.get(id)?.remainingKg ?? 0);
+        return (
+          <Space direction="vertical" size={0}>
+            <Text>{herb.name}</Text>
+            <Text type={remaining <= STOCK_EPS ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>
+              余 {formatKg(remaining)}kg{remaining <= STOCK_EPS ? ' · 已用完' : ''}
+            </Text>
+          </Space>
+        );
+      },
+    },
     { title: '方法', dataIndex: 'methodId', width: 90, render: (id: string) => methodOf(id)?.name ?? '-' },
     {
       title: '火候',
@@ -222,11 +282,24 @@ export default function BatchBoard() {
               放行
             </Button>
           )}
-          <Popconfirm title={`确认删除 ${record.batchNo}？`} onConfirm={() => removeBatch(record.id).then(() => message.success('已删除'))}>
-            <Button size="small" type="link" danger>
-              删除
-            </Button>
-          </Popconfirm>
+          {!record.locked ? (
+            <Popconfirm
+              title={`确认撤销 ${record.batchNo}？`}
+              description="撤销后对应药材批次余量将自动加回"
+              onConfirm={async () => {
+                const ok = await removeBatch(record.id);
+                if (ok) {
+                  message.success('已撤销，余量已重算');
+                } else {
+                  message.error('锁定记录继续占用余量，需先放行解锁');
+                }
+              }}
+            >
+              <Button size="small" type="link" danger>
+                撤销
+              </Button>
+            </Popconfirm>
+          ) : null}
         </Space>
       ),
     },
@@ -238,7 +311,7 @@ export default function BatchBoard() {
         炮制工序记录台
       </Title>
       <Paragraph type="secondary">
-        选择方法即带出辅料比例、火候与判断标准；录入实际锅温、时长与炮制后重量，系统按标准自动给出程度判定，提交后锁定该批。
+        选择方法即带出辅料比例、火候与判断标准；每条工序按投料量核销对应药材批次余量（锁定记录继续占用，未锁定记录改动或撤销后余量自动重算），余量清零的批次不可再选。
       </Paragraph>
 
       <Space style={{ marginBottom: 12 }} wrap>
@@ -247,6 +320,16 @@ export default function BatchBoard() {
         </Button>
         <Button onClick={() => setShowRules((v) => !v)}>{showRules ? '收起程度判定规则' : '查看程度判定规则'}</Button>
       </Space>
+
+      {availableHerbs.length === 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="所有药材批次余量均已用完"
+          description="无法新建工序，请先到药材台账登记新的药材批次。"
+        />
+      ) : null}
 
       {showRules ? (
         <Card size="small" style={{ marginBottom: 12 }} title="炮制程度判定规则">
@@ -294,6 +377,21 @@ export default function BatchBoard() {
           form={form}
           layout="vertical"
           onValuesChange={(changed) => {
+            if ('herbId' in changed) {
+              // 换药材批次：投料量不超过该批次余量，并按当前方法重算辅料与预计产出
+              const available = availableFor(changed.herbId);
+              const currentFeed = Number(form.getFieldValue('feedKg')) || 0;
+              const feed = currentFeed > available + STOCK_EPS || currentFeed <= 0 ? Number(available.toFixed(3)) : currentFeed;
+              const method = methods.find((m) => m.id === form.getFieldValue('methodId'));
+              form.setFieldsValue(
+                {
+                  feedKg: feed,
+                  auxUsedKg: method ? Number(((feed * method.auxRatio) / 100).toFixed(2)) : undefined,
+                  outputKg: method ? Number((feed * (method.name === '蜜炙' ? 1.08 : 0.94)).toFixed(1)) : undefined,
+                } as unknown as BatchFormValues,
+              );
+              form.validateFields(['feedKg']).catch(() => undefined);
+            }
             if ('methodId' in changed) {
               const method = methods.find((m) => m.id === changed.methodId);
               if (method) {
@@ -337,12 +435,20 @@ export default function BatchBoard() {
           </Form.Item>
 
           <Space size={12} style={{ display: 'flex' }} align="start">
-            <Form.Item name="herbId" label="药材" rules={[{ required: true, message: '请选择药材' }]} style={{ flex: 1 }}>
+            <Form.Item name="herbId" label="药材批次" rules={[{ required: true, message: '请选择药材' }]} style={{ flex: 1 }}>
               <Select
                 showSearch
                 optionFilterProp="label"
+                placeholder={availableHerbs.length === 0 ? '药材批次均已用完，请先登记' : '只列出还有余量的批次'}
                 disabled={Boolean(editing?.locked) && !qcMode}
-                options={herbs.map((h) => ({ label: `${h.name} · ${h.batchNo}（${h.feedKg}kg）`, value: h.id }))}
+                options={herbOptions.map((h) => {
+                  const remaining = Math.max(0, stockMap.get(h.id)?.remainingKg ?? 0);
+                  const exhausted = remaining <= STOCK_EPS;
+                  return {
+                    value: h.id,
+                    label: `${h.name} · ${h.batchNo}（余量 ${formatKg(remaining)}/${formatKg(h.feedKg)}kg${exhausted ? ' · 已用完' : ''}）`,
+                  };
+                })}
               />
             </Form.Item>
             <Form.Item name="methodId" label="炮制方法" rules={[{ required: true, message: '请选择炮制方法' }]} style={{ flex: 1 }}>
@@ -352,6 +458,21 @@ export default function BatchBoard() {
               />
             </Form.Item>
           </Space>
+
+          {watchedHerb ? (
+            <Alert
+              type={watchedAvailable <= STOCK_EPS ? 'error' : 'info'}
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={
+                watchedAvailable <= STOCK_EPS
+                  ? `药材「${watchedHerb.name}（${watchedHerb.batchNo}）」余量已清零，不能再投料，请更换有余量的批次`
+                  : `药材「${watchedHerb.name}（${watchedHerb.batchNo}）」入库 ${formatKg(watchedHerb.feedKg)}kg，已用 ${formatKg(
+                      (stockMap.get(watchedHerb.id)?.usedKg ?? 0) - (editing && watchedHerb.id === editing.herbId ? editing.feedKg : 0),
+                    )}kg，本次可投 ${formatKg(watchedAvailable)}kg`
+              }
+            />
+          ) : null}
 
           {watchedMethod ? (
             <Alert
@@ -400,8 +521,30 @@ export default function BatchBoard() {
             </Form.Item>
           </Space>
 
-          <Form.Item name="feedKg" label="投料量(kg)" rules={[{ required: true, message: '请输入投料量' }]} style={{ maxWidth: 200 }}>
-            <InputNumber min={0} step={1} style={{ width: '100%' }} disabled={Boolean(editing?.locked) && !qcMode} />
+          <Form.Item
+            name="feedKg"
+            label={`投料量(kg)${watchedHerb ? ` · 本次可投 ${formatKg(watchedAvailable)}kg` : ''}`}
+            rules={[
+              { required: true, message: '请输入投料量' },
+              {
+                validator: (_, value) => {
+                  const feed = Number(value);
+                  if (feed !== undefined && feed !== null && feed > watchedAvailable + STOCK_EPS) {
+                    return Promise.reject(new Error(`超出余量：该批次最多可投 ${formatKg(watchedAvailable)}kg`));
+                  }
+                  return Promise.resolve();
+                },
+              },
+            ]}
+            style={{ maxWidth: 260 }}
+          >
+            <InputNumber
+              min={0}
+              max={watchedAvailable > 0 ? Number(watchedAvailable.toFixed(3)) : undefined}
+              step={1}
+              style={{ width: '100%' }}
+              disabled={Boolean(editing?.locked) && !qcMode}
+            />
           </Form.Item>
 
           <Alert

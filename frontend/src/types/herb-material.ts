@@ -26,11 +26,16 @@ export interface HerbMaterial {
 export const HERB_ORIGINS: HerbOrigin[] = ['植物', '动物', '矿物'];
 export const HERB_PARTS: HerbPart[] = ['根', '茎', '叶', '果实'];
 
-/** 按药材名分组的待炮制汇总 */
+/** 按药材名分组的台账汇总（待炮制量按批次余量合计） */
 export interface HerbGroupSummary {
   name: string;
   origin: HerbOrigin;
   part: HerbPart;
   batches: number;
+  /** 入库量合计（kg） */
+  feedKg: number;
+  /** 已核销合计（kg） */
+  usedKg: number;
+  /** 余量合计（kg） */
   pendingKg: number;
 }
