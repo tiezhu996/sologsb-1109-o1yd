@@ -8,7 +8,9 @@ import { useHerbStore } from '../stores/herbStore';
 import { useMethodStore } from '../stores/methodStore';
 import { useBatchStore } from '../stores/batchStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useHerbUsage } from '../hooks/useHerbUsage';
 import { dueSamples, formatDate } from '../utils/degree';
+import { KG_EPSILON, roundKg } from '../utils/herb-usage';
 import type { ProcessBatch } from '../types/process-batch';
 import type { SampleExpiry } from '../types/retain-sample';
 
@@ -22,6 +24,13 @@ export default function ProcessBoard() {
   const samples = useSampleStore((s) => s.samples);
 
   const pending = useMemo(() => batches.filter((b) => !b.locked), [batches]);
+  const usage = useHerbUsage();
+  // 待炮制量：按全部药材批次余量合计（锁定工序继续占用，不计入余量）
+  const pendingKg = useMemo(
+    () => roundKg(Array.from(usage.values()).reduce((sum, u) => sum + u.remainingKg, 0)),
+    [usage],
+  );
+  const exhaustedBatches = useMemo(() => Array.from(usage.values()).filter((u) => u.remainingKg <= KG_EPSILON).length, [usage]);
   const due = useMemo(() => dueSamples(samples, 30), [samples]);
   const degreeCount = useMemo(() => {
     return batches.reduce(
@@ -100,10 +109,10 @@ export default function ProcessBoard() {
 
       <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
         <Col xs={12} md={6}>
-          <StatBadge label="待炮制（未锁定）批次" value={pending.length} unit="批" status="warning" hint="得率与程度判定提交后即锁定" />
+          <StatBadge label="待炮制量（全部批次余量合计）" value={pendingKg} unit="kg" status="warning" hint={`各药材批次入库量 − 工序已用量；共 ${exhaustedBatches} 批已用完`} />
         </Col>
         <Col xs={12} md={6}>
-          <StatBadge label="在册药材批次" value={herbs.length} unit="批" />
+          <StatBadge label="在册药材批次" value={herbs.length} unit="批" hint={`${exhaustedBatches} 批余量已清零`} />
         </Col>
         <Col xs={12} md={6}>
           <StatBadge label="30 天内到期留样" value={due.length} unit="份" status={due.length > 0 ? 'error' : 'success'} />
@@ -140,7 +149,7 @@ export default function ProcessBoard() {
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={15}>
           <Card
-            title="待炮制批次"
+            title="待判定工序（未锁定记录）"
             size="small"
             extra={
               <Link to="/batches">

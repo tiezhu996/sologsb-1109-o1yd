@@ -5,8 +5,10 @@ import dayjs, { type Dayjs } from 'dayjs';
 import FilterBar from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
 import { useHerbFilter } from '../hooks/useHerbFilter';
+import { useHerbUsage } from '../hooks/useHerbUsage';
 import { useHerbStore } from '../stores/herbStore';
 import { HERB_ORIGINS, HERB_PARTS, type HerbMaterial } from '../types/herb-material';
+import { KG_EPSILON } from '../utils/herb-usage';
 import { formatDate } from '../utils/degree';
 
 const { Title, Paragraph, Text } = Typography;
@@ -29,6 +31,7 @@ export default function HerbList() {
   const updateHerb = useHerbStore((s) => s.updateHerb);
   const removeHerb = useHerbStore((s) => s.removeHerb);
   const filter = useHerbFilter();
+  const usage = useHerbUsage();
   const [form] = Form.useForm<HerbFormValues>();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<HerbMaterial | null>(null);
@@ -40,11 +43,12 @@ export default function HerbList() {
     visible.forEach((herb) => {
       const row = map.get(herb.name) ?? { name: herb.name, origin: herb.origin, part: herb.part, batches: 0, kg: 0 };
       row.batches += 1;
-      row.kg += herb.feedKg;
+      // 待炮制量按全部余量合计（入库量 − 工序已核销量）
+      row.kg += usage.get(herb.id)?.remainingKg ?? 0;
       map.set(herb.name, row);
     });
     return Array.from(map.values()).sort((a, b) => b.kg - a.kg);
-  }, [visible]);
+  }, [visible, usage]);
 
   const openCreate = () => {
     setEditing(null);
@@ -61,6 +65,14 @@ export default function HerbList() {
 
   const submit = async () => {
     const values = await form.validateFields();
+    if (editing) {
+      // 入库量不能下调到已核销用量以下（锁定与未锁定工序都占用余量）
+      const usedKg = usage.get(editing.id)?.usedKg ?? 0;
+      if (values.feedKg < usedKg - KG_EPSILON) {
+        message.error(`该批次已核销 ${usedKg}kg，入库量不能小于已用量`);
+        return;
+      }
+    }
     const payload = {
       name: values.name,
       origin: values.origin,
@@ -85,7 +97,36 @@ export default function HerbList() {
     { title: '基原', dataIndex: 'origin', width: 80, render: (v: string) => <Tag color="green">{v}</Tag> },
     { title: '药用部位', dataIndex: 'part', width: 90 },
     { title: '批次号', dataIndex: 'batchNo', width: 120 },
-    { title: '投料量(kg)', dataIndex: 'feedKg', width: 110, align: 'right' },
+    { title: '入库量(kg)', dataIndex: 'feedKg', width: 100, align: 'right' },
+    {
+      title: '已用(kg)',
+      width: 90,
+      align: 'right',
+      render: (_, record) => usage.get(record.id)?.usedKg ?? 0,
+    },
+    {
+      title: '余量(kg)',
+      width: 90,
+      align: 'right',
+      render: (_, record) => {
+        const remaining = usage.get(record.id)?.remainingKg ?? record.feedKg;
+        return (
+          <Text strong type={remaining <= KG_EPSILON ? 'secondary' : undefined}>
+            {remaining}
+          </Text>
+        );
+      },
+    },
+    {
+      title: '状态',
+      width: 90,
+      render: (_, record) =>
+        (usage.get(record.id)?.remainingKg ?? record.feedKg) <= KG_EPSILON ? (
+          <Tag color="default">已用完</Tag>
+        ) : (
+          <Tag color="green">可投料</Tag>
+        ),
+    },
     { title: '入库时间', dataIndex: 'receivedAt', width: 120, render: (v: string) => formatDate(v) },
     { title: '备注', dataIndex: 'remark', ellipsis: true, render: (v?: string) => v ?? '-' },
     {
@@ -112,7 +153,7 @@ export default function HerbList() {
       <Title level={3} style={{ marginBottom: 4 }}>
         药材与批次台账
       </Title>
-      <Paragraph type="secondary">按基原与药用部位筛选，按药材名分组回显批次数与待炮制投料量。</Paragraph>
+      <Paragraph type="secondary">按基原与药用部位筛选；每批显示入库量、工序已核销量与余量，余量清零自动标记为「已用完」，按药材名汇总待炮制余量。</Paragraph>
 
       <Space style={{ marginBottom: 12 }}>
         <Button type="primary" onClick={openCreate}>
@@ -144,7 +185,7 @@ export default function HerbList() {
         </EmptyPanel>
       ) : (
         <>
-          <Card size="small" title="按药材分组汇总" style={{ marginBottom: 16 }}>
+          <Card size="small" title="按药材分组汇总（待炮制量＝全部余量合计）" style={{ marginBottom: 16 }}>
             <Table
               rowKey="name"
               size="small"
@@ -155,11 +196,11 @@ export default function HerbList() {
                 { title: '基原', dataIndex: 'origin', width: 80 },
                 { title: '药用部位', dataIndex: 'part', width: 90 },
                 { title: '批次数', dataIndex: 'batches', width: 90, align: 'right' },
-                { title: '待炮制量(kg)', dataIndex: 'kg', width: 130, align: 'right', render: (v: number) => v.toFixed(1) },
+                { title: '待炮制余量(kg)', dataIndex: 'kg', width: 140, align: 'right', render: (v: number) => v.toFixed(1) },
               ]}
             />
           </Card>
-          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1000 }} />
+          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1150 }} />
         </>
       )}
 
@@ -185,8 +226,13 @@ export default function HerbList() {
           <Form.Item name="batchNo" label="批次号" rules={[{ required: true, message: '请输入批次号' }]}>
             <Input placeholder="如：BT-2401" maxLength={24} />
           </Form.Item>
-          <Form.Item name="feedKg" label="投料量(kg)" rules={[{ required: true, message: '请输入投料量' }]}>
-            <InputNumber min={0} step={1} style={{ width: '100%' }} />
+          <Form.Item
+            name="feedKg"
+            label="入库量(kg)"
+            rules={[{ required: true, message: '请输入入库量' }]}
+            extra={editing ? `已核销 ${usage.get(editing.id)?.usedKg ?? 0}kg，入库量不能小于已用量` : undefined}
+          >
+            <InputNumber min={editing ? usage.get(editing.id)?.usedKg ?? 0 : 0} step={1} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="receivedAt" label="入库时间" rules={[{ required: true, message: '请选择入库时间' }]}>
             <DatePicker style={{ width: '100%' }} />

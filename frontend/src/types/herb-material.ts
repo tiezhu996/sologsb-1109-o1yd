@@ -25,12 +25,3 @@ export interface HerbMaterial {
 
 export const HERB_ORIGINS: HerbOrigin[] = ['植物', '动物', '矿物'];
 export const HERB_PARTS: HerbPart[] = ['根', '茎', '叶', '果实'];
-
-/** 按药材名分组的待炮制汇总 */
-export interface HerbGroupSummary {
-  name: string;
-  origin: HerbOrigin;
-  part: HerbPart;
-  batches: number;
-  pendingKg: number;
-}

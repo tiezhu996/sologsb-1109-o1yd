@@ -41,16 +41,19 @@ function isoMinutesAgo(minutes: number): string {
 function buildSeedBatches(): ProcessBatch[] {
   const plan: Array<[string, string, string, number, number, number, string, string, string]> = [
     // batchNo, herbId, methodId, feedKg, auxUsedKg, durationMin, fireLevel, operator, remark
-    ['PZ-25081', 'herb-001', 'method-002', 120, 12, 10, '中火', '陈玉兰', '麸炒白术'],
-    ['PZ-25082', 'herb-002', 'method-003', 80, 8, 15, '文火', '陈玉兰', '酒炙白芍'],
-    ['PZ-25083', 'herb-003', 'method-003', 60, 6, 15, '文火', '刘建国', '酒炙当归'],
-    ['PZ-25084', 'herb-004', 'method-001', 45, 0, 12, '文火', '刘建国', '清炒陈皮'],
-    ['PZ-25085', 'herb-005', 'method-006', 200, 50, 16, '中火', '王丽', '蜜炙黄芪'],
-    ['PZ-25086', 'herb-006', 'method-010', 150, 0, 45, '武火', '王丽', '煅牡蛎'],
-    ['PZ-25087', 'herb-008', 'method-005', 90, 1.8, 12, '文火', '陈玉兰', '盐炙杜仲'],
-    ['PZ-25088', 'herb-009', 'method-001', 55, 0, 12, '文火', '刘建国', '清炒桑叶'],
-    ['PZ-25089', 'herb-010', 'method-006', 130, 32.5, 16, '中火', '王丽', '蜜炙甘草'],
-    ['PZ-25090', 'herb-007', 'method-002', 12, 1.2, 10, '中火', '王丽', '麸炒全蝎'],
+    // 同批药材分次炮制时，各工序按投料量逐次核销，台账余量随记录变化
+    ['PZ-25081', 'herb-001', 'method-002', 50, 5, 10, '中火', '陈玉兰', '麸炒白术（第一次）'],
+    ['PZ-25082', 'herb-001', 'method-002', 40, 4, 10, '中火', '陈玉兰', '麸炒白术（第二次）'],
+    ['PZ-25083', 'herb-002', 'method-003', 80, 8, 15, '文火', '陈玉兰', '酒炙白芍'],
+    ['PZ-25084', 'herb-003', 'method-003', 35, 3.5, 15, '文火', '刘建国', '酒炙当归'],
+    ['PZ-25085', 'herb-004', 'method-001', 45, 0, 12, '文火', '刘建国', '清炒陈皮'],
+    ['PZ-25086', 'herb-005', 'method-006', 120, 30, 16, '中火', '王丽', '蜜炙黄芪（第一次）'],
+    ['PZ-25087', 'herb-006', 'method-010', 150, 0, 45, '武火', '王丽', '煅牡蛎'],
+    ['PZ-25088', 'herb-008', 'method-005', 60, 1.2, 12, '文火', '陈玉兰', '盐炙杜仲'],
+    ['PZ-25089', 'herb-009', 'method-001', 55, 0, 12, '文火', '刘建国', '清炒桑叶'],
+    ['PZ-25090', 'herb-010', 'method-006', 60, 15, 16, '中火', '王丽', '蜜炙甘草（第一次）'],
+    ['PZ-25091', 'herb-010', 'method-006', 70, 17.5, 16, '中火', '王丽', '蜜炙甘草（第二次）'],
+    ['PZ-25092', 'herb-007', 'method-002', 12, 1.2, 10, '中火', '王丽', '麸炒全蝎'],
   ];
 
   return plan.map(([batchNo, herbId, methodId, feedKg, auxUsedKg, duration, fireLevel, operator, remark], index) => {

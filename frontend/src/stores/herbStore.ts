@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { db } from '../utils/db';
 import { uid } from '../utils/id';
-import type { HerbGroupSummary, HerbMaterial, HerbOrigin, HerbPart } from '../types/herb-material';
+import type { HerbMaterial, HerbOrigin, HerbPart } from '../types/herb-material';
 
 export interface HerbInput {
   name: string;
@@ -20,8 +20,6 @@ interface HerbState {
   addHerb: (input: HerbInput) => Promise<HerbMaterial>;
   updateHerb: (id: string, patch: Partial<HerbInput>) => Promise<void>;
   removeHerb: (id: string) => Promise<void>;
-  /** 按药材分组回显批次与待炮制量 */
-  groupSummary: () => HerbGroupSummary[];
 }
 
 export const useHerbStore = create<HerbState>()((set, get) => ({
@@ -62,20 +60,5 @@ export const useHerbStore = create<HerbState>()((set, get) => ({
   removeHerb: async (id) => {
     await db.herbs.delete(id);
     set({ herbs: get().herbs.filter((h) => h.id !== id) });
-  },
-
-  groupSummary: () => {
-    const map = new Map<string, HerbGroupSummary>();
-    get().herbs.forEach((herb) => {
-      const key = herb.name;
-      const existed = map.get(key);
-      if (existed) {
-        existed.batches += 1;
-        existed.pendingKg += herb.feedKg;
-      } else {
-        map.set(key, { name: herb.name, origin: herb.origin, part: herb.part, batches: 1, pendingKg: herb.feedKg });
-      }
-    });
-    return Array.from(map.values()).sort((a, b) => b.pendingKg - a.pendingKg);
   },
 }));

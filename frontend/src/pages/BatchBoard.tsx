@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Alert, App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from 'antd';
+import { Alert, App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import dayjs, { type Dayjs } from 'dayjs';
 import { useSearchParams } from 'react-router-dom';
@@ -8,6 +8,7 @@ import FireLevelTag from '../components/common/FireLevelTag';
 import RatioCalculator from '../components/common/RatioCalculator';
 import EmptyPanel from '../components/common/EmptyPanel';
 import { useHerbFilter } from '../hooks/useHerbFilter';
+import { useHerbUsage } from '../hooks/useHerbUsage';
 import { useHerbStore } from '../stores/herbStore';
 import { useMethodStore } from '../stores/methodStore';
 import { useBatchStore } from '../stores/batchStore';
@@ -15,6 +16,7 @@ import { HERB_ORIGINS, HERB_PARTS } from '../types/herb-material';
 import { FIRE_LEVELS, type FireLevel } from '../types/processing-method';
 import { PROCESS_DEGREES, type ProcessBatch, type ProcessDegree } from '../types/process-batch';
 import { DEGREE_RULES, judgeDegree, suggestedValues } from '../utils/degree';
+import { KG_EPSILON, roundKg } from '../utils/herb-usage';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -50,6 +52,7 @@ export default function BatchBoard() {
   const removeBatch = useBatchStore((s) => s.removeBatch);
 
   const herbFilter = useHerbFilter();
+  const usage = useHerbUsage();
   const [params] = useSearchParams();
   const degreeParam = params.get('degree') ?? '';
 
@@ -89,23 +92,58 @@ export default function BatchBoard() {
     });
   }, [batches, visibleHerbs, degreeParam]);
 
+  /** 弹窗中当前选中药材批次：编辑本记录时，自身占用计入本次可投量 */
+  const selectedHerbInfo = useMemo(() => {
+    const herbId = watched?.herbId ?? '';
+    if (!herbId) return undefined;
+    const herb = herbs.find((h) => h.id === herbId);
+    if (!herb) return undefined;
+    const ownFeed = editing && editing.herbId === herbId ? editing.feedKg : 0;
+    const info = usage.get(herbId);
+    const received = info?.receivedKg ?? herb.feedKg;
+    const used = info ? roundKg(Math.min(info.usedKg, received)) : 0;
+    const remaining = info?.remainingKg ?? herb.feedKg;
+    return { herb, received, used, remaining, availableKg: roundKg(remaining + ownFeed) };
+  }, [watched?.herbId, herbs, usage, editing]);
+
+  /** 药材下拉项：新建仅列有余量批次；编辑时把当前所选批次一并列出 */
+  const herbOptions = useMemo(() => {
+    return herbs
+      .map((h) => {
+        const own = editing && editing.herbId === h.id ? editing.feedKg : 0;
+        const remaining = usage.get(h.id)?.remainingKg ?? h.feedKg;
+        return { h, own, remaining, availableKg: roundKg(remaining + own) };
+      })
+      .filter((x) => x.availableKg > KG_EPSILON)
+      .map((x) => ({
+        label:
+          x.own > KG_EPSILON
+            ? `${x.h.name} · ${x.h.batchNo}（余 ${x.remaining}kg，本批已投 ${x.own}kg）`
+            : `${x.h.name} · ${x.h.batchNo}（余 ${x.remaining}kg）`,
+        value: x.h.id,
+      }));
+  }, [herbs, usage, editing]);
+
   const herbName = (id: string) => herbs.find((h) => h.id === id)?.name ?? '未知药材';
   const methodOf = (id: string) => methods.find((m) => m.id === id);
 
   const openCreate = () => {
-    setEditing(null);
-    setQcMode(false);
-    form.resetFields();
-    const firstHerb = herbs[0];
+    // 新增工序只列还有余量的批次；全部用完时直接拦住，避免误登记
+    const firstHerb = herbs.find((h) => (usage.get(h.id)?.remainingKg ?? h.feedKg) > KG_EPSILON);
+    if (!firstHerb) {
+      message.warning('全部药材批次均已用完，请先到药材台账登记新批次');
+      return;
+    }
     const firstMethod = methods[0];
+    const firstRemaining = roundKg(usage.get(firstHerb.id)?.remainingKg ?? firstHerb.feedKg);
     const now = dayjs();
     const base: Partial<BatchFormValues> = {
       batchNo: `PZ-${dayjs().format('YYMMDD')}-${String(batches.length + 1).padStart(2, '0')}`,
-      herbId: firstHerb?.id,
+      herbId: firstHerb.id,
       methodId: firstMethod?.id,
-      feedKg: firstHerb?.feedKg ?? 100,
-      outputKg: Number((((firstHerb?.feedKg ?? 100) * 0.94)).toFixed(1)),
-      auxUsedKg: Number((((firstHerb?.feedKg ?? 100) * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
+      feedKg: firstRemaining,
+      outputKg: Number((firstRemaining * (firstMethod?.name === '蜜炙' ? 1.08 : 0.94)).toFixed(1)),
+      auxUsedKg: Number(((firstRemaining * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
       fireLevel: firstMethod?.fireLevel ?? '文火',
       temp: firstMethod ? Math.round((firstMethod.tempRange[0] + firstMethod.tempRange[1]) / 2) : 100,
       duration: firstMethod?.duration ?? 12,
@@ -114,6 +152,9 @@ export default function BatchBoard() {
       operator: '陈玉兰',
       degree: '适中',
     };
+    setEditing(null);
+    setQcMode(false);
+    form.resetFields();
     form.setFieldsValue(base as unknown as BatchFormValues);
     setOpen(true);
   };
@@ -150,6 +191,11 @@ export default function BatchBoard() {
       message.error('投料量必须大于 0');
       return;
     }
+    // 超出余量时提示可投数量并拦住保存
+    if (selectedHerbInfo && feedKg > selectedHerbInfo.availableKg + KG_EPSILON) {
+      message.error(`超出该批次余量，最多可投 ${selectedHerbInfo.availableKg}kg`);
+      return;
+    }
     const yieldRate = Number(((outputKg / feedKg) * 100).toFixed(1));
     const payload = {
       batchNo: values.batchNo,
@@ -166,7 +212,13 @@ export default function BatchBoard() {
       remark: values.remark,
     };
     if (editing) {
-      const ok = await updateBatch(editing.id, payload, qcMode);
+      let ok = false;
+      try {
+        ok = await updateBatch(editing.id, payload, qcMode);
+      } catch (error) {
+        message.error((error as Error).message);
+        return;
+      }
       if (!ok) {
         message.error('该批已锁定，请打开「质检员改判」后再提交');
         return;
@@ -174,9 +226,14 @@ export default function BatchBoard() {
       if (qcMode && editing.locked) {
         await unlockAsQc(editing.id, '质检员 · 赵敏');
       }
-      message.success(`已更新 ${payload.batchNo}，得率 ${yieldRate}%`);
+      message.success(`已更新 ${payload.batchNo}，得率 ${yieldRate}%，余量已重算`);
     } else {
-      await createBatch(payload, true);
+      try {
+        await createBatch(payload, true);
+      } catch (error) {
+        message.error((error as Error).message);
+        return;
+      }
       message.success(`已提交 ${payload.batchNo}，得率 ${yieldRate}%，该批已锁定`);
     }
     setOpen(false);
@@ -222,11 +279,29 @@ export default function BatchBoard() {
               放行
             </Button>
           )}
-          <Popconfirm title={`确认删除 ${record.batchNo}？`} onConfirm={() => removeBatch(record.id).then(() => message.success('已删除'))}>
-            <Button size="small" type="link" danger>
-              删除
-            </Button>
-          </Popconfirm>
+          {record.locked ? (
+            <Tooltip title="锁定记录继续占用余量，需质检员放行后才能撤销">
+              <span>
+                <Button size="small" type="link" danger disabled>
+                  删除
+                </Button>
+              </span>
+            </Tooltip>
+          ) : (
+            <Popconfirm
+              title={`确认删除 ${record.batchNo}？`}
+              description="删除后该批投料回补为药材余量。"
+              onConfirm={() =>
+                removeBatch(record.id).then((ok) =>
+                  ok ? message.success('已删除，余量已回补') : message.error('该批已锁定，需质检员放行后才能撤销'),
+                )
+              }
+            >
+              <Button size="small" type="link" danger>
+                删除
+              </Button>
+            </Popconfirm>
+          )}
         </Space>
       ),
     },
@@ -238,7 +313,7 @@ export default function BatchBoard() {
         炮制工序记录台
       </Title>
       <Paragraph type="secondary">
-        选择方法即带出辅料比例、火候与判断标准；录入实际锅温、时长与炮制后重量，系统按标准自动给出程度判定，提交后锁定该批。
+        每条工序按所选药材批次核销投料量：仅可选择有余量的批次、投料不得超过可投量；未锁定记录改动或撤销后余量自动重算，锁定记录继续占用余量。
       </Paragraph>
 
       <Space style={{ marginBottom: 12 }} wrap>
@@ -307,6 +382,19 @@ export default function BatchBoard() {
                 } as unknown as BatchFormValues);
               }
             }
+            if ('herbId' in changed) {
+              // 切换药材批次：投料量自动带为该批可投量（编辑本记录时含自身占用），并重算辅料与产量
+              const herbId = changed.herbId as string;
+              const own = editing && editing.herbId === herbId ? editing.feedKg : 0;
+              const remaining = usage.get(herbId)?.remainingKg ?? herbs.find((h) => h.id === herbId)?.feedKg ?? 0;
+              const avail = roundKg(remaining + own);
+              const method = methods.find((m) => m.id === form.getFieldValue('methodId'));
+              form.setFieldsValue({
+                feedKg: avail,
+                auxUsedKg: method ? Number(((avail * method.auxRatio) / 100).toFixed(2)) : 0,
+                outputKg: Number((avail * (method?.name === '蜜炙' ? 1.08 : 0.94)).toFixed(1)),
+              } as unknown as BatchFormValues);
+            }
             if ('feedKg' in changed) {
               const method = methods.find((m) => m.id === form.getFieldValue('methodId'));
               if (method) {
@@ -337,12 +425,13 @@ export default function BatchBoard() {
           </Form.Item>
 
           <Space size={12} style={{ display: 'flex' }} align="start">
-            <Form.Item name="herbId" label="药材" rules={[{ required: true, message: '请选择药材' }]} style={{ flex: 1 }}>
+            <Form.Item name="herbId" label="药材批次（仅列有余量批次）" rules={[{ required: true, message: '请选择药材批次' }]} style={{ flex: 1 }}>
               <Select
                 showSearch
                 optionFilterProp="label"
                 disabled={Boolean(editing?.locked) && !qcMode}
-                options={herbs.map((h) => ({ label: `${h.name} · ${h.batchNo}（${h.feedKg}kg）`, value: h.id }))}
+                options={herbOptions}
+                notFoundContent="全部药材批次均已用完，请先登记新批次"
               />
             </Form.Item>
             <Form.Item name="methodId" label="炮制方法" rules={[{ required: true, message: '请选择炮制方法' }]} style={{ flex: 1 }}>
@@ -366,6 +455,19 @@ export default function BatchBoard() {
                 </Space>
               }
               description={`判断标准：${watchedMethod.criterion}；适用药材：${watchedMethod.applicable}`}
+            />
+          ) : null}
+
+          {selectedHerbInfo ? (
+            <Alert
+              type={selectedHerbInfo.availableKg <= KG_EPSILON ? 'error' : 'info'}
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={
+                selectedHerbInfo.availableKg <= KG_EPSILON
+                  ? `${selectedHerbInfo.herb.name}（${selectedHerbInfo.herb.batchNo}）余量已为 0，请改选其他批次`
+                  : `${selectedHerbInfo.herb.name}（${selectedHerbInfo.herb.batchNo}）入库 ${selectedHerbInfo.received}kg · 已用 ${selectedHerbInfo.used}kg · 余量 ${selectedHerbInfo.remaining}kg，本次最多可投 ${selectedHerbInfo.availableKg}kg`
+              }
             />
           ) : null}
 
@@ -400,8 +502,27 @@ export default function BatchBoard() {
             </Form.Item>
           </Space>
 
-          <Form.Item name="feedKg" label="投料量(kg)" rules={[{ required: true, message: '请输入投料量' }]} style={{ maxWidth: 200 }}>
-            <InputNumber min={0} step={1} style={{ width: '100%' }} disabled={Boolean(editing?.locked) && !qcMode} />
+          <Form.Item
+            name="feedKg"
+            label={`投料量(kg)${selectedHerbInfo ? `（该批最多可投 ${selectedHerbInfo.availableKg}kg）` : ''}`}
+            rules={[
+              { required: true, message: '请输入投料量' },
+              {
+                validator: (_, value) => {
+                  const v = Number(value) || 0;
+                  if (v <= 0) {
+                    return Promise.reject(new Error('投料量必须大于 0'));
+                  }
+                  if (selectedHerbInfo && v > selectedHerbInfo.availableKg + KG_EPSILON) {
+                    return Promise.reject(new Error(`超出该批次余量，最多可投 ${selectedHerbInfo.availableKg}kg`));
+                  }
+                  return Promise.resolve();
+                },
+              },
+            ]}
+            style={{ maxWidth: 260 }}
+          >
+            <InputNumber min={0} max={selectedHerbInfo?.availableKg} step={1} style={{ width: '100%' }} disabled={Boolean(editing?.locked) && !qcMode} />
           </Form.Item>
 
           <Alert
